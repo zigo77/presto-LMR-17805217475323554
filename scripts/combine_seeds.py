@@ -1,6 +1,5 @@
 import glob
 import os
-import numpy as np
 import xarray as xr
 
 RECON_DIR  = '/recons'
@@ -29,22 +28,7 @@ tas    = xr.concat(tas_list,    dim='seed').transpose('time', 'seed', 'lat', 'lo
 # tas_gm: all ensemble members across all seeds → concat along 'ens' dim
 tas_gm = xr.concat(tas_gm_list, dim='ens')
 
-# int16 quantization keeps combined_recon.nc under GitHub's 100 MB file limit.
-# Per-variable scale_factor sized to each field's dynamic range:
-#   tas (full field, wide range ~+/-100 K):  0.01  -> 0.005 K precision
-#   tas_gm (global mean, ~+/-5 K):           0.0001 -> 0.00005 K precision
-def _encoding(da):
-    rng = float(max(abs(da.min()), abs(da.max())))
-    scale = 0.0001 if rng < 5 else 0.01
-    return {
-        'zlib': True, 'complevel': 5, 'shuffle': True,
-        'dtype': 'int16', 'scale_factor': scale, 'add_offset': 0.0,
-        '_FillValue': np.int16(-32768),
-    }
-
-out = xr.Dataset({'tas': tas, 'tas_gm': tas_gm})
-encoding = {v: _encoding(out[v]) for v in out.data_vars}
-out.to_netcdf(OUT_PATH, encoding=encoding)
+xr.Dataset({'tas': tas, 'tas_gm': tas_gm}).to_netcdf(OUT_PATH)
 
 print(f'combined_recon.nc written: {OUT_PATH}')
 print(f'  tas    {dict(tas.sizes)}')
