@@ -1,0 +1,71 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# GitHub
+.github
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info
+dist
+build
+.eggs
+.pytest_cache
+.coverage
+htmlcov
+.tox
+.nox
+.hypothesis
+.mypy_cache
+.dmypy.json
+dmypy.json
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDEs
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Conda
+.conda
+
+# Data files (adjust as needed)
+*.csv
+*.nc
+*.h5
+*.hdf5
+data/
+outputs/
+
+# Documentation
+*.md
+docs/
+LICENSE
+README*
+
+# CI/CD
+.travis.yml
+.gitlab-ci.yml
+azure-pipelines.yml

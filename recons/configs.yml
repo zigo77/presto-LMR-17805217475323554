@@ -1,0 +1,252 @@
+allownan: false
+annualize_proxydb_months:
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+- 10
+- 11
+- 12
+annualize_proxydb_ptypes:
+- coral
+assim_frac: 0.75
+compress_params:
+  zlib: true
+filter_proxydb_args: []
+filter_proxydb_kwargs:
+  by: ptype
+  keys:
+  - coral
+  - tree
+  - ice
+  - lake
+  - bivalve
+nens: 100
+nobs_lb: 25
+obs_anom_period:
+- 1951
+- 1980
+obs_lat_name: lat
+obs_lon_name: lon
+obs_path:
+  pr: https://atmos.uw.edu/~wperkins/nobackup/lmr_data/data/analyses/GPCC/GPCC_precip.mon.flux.1x1.v6.nc
+  tas: gistemp1200_ERSSTv4
+obs_rename_dict:
+  pr: precip
+  tas: tempanomaly
+obs_time_name: time
+output_full_ens: false
+output_indices:
+- gm
+- nhm
+- shm
+prior_annualize_months:
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+- 10
+- 11
+- 12
+prior_anom_period:
+- 850
+- 1850
+prior_lat_name: lat
+prior_lon_name: lon
+prior_path:
+  pr: https://atmos.uw.edu/~wperkins/nobackup/lmr_data/data/model/ccsm4_last_millenium/pr_sfc_Amon_CCSM4_past1000_085001-185012.nc
+  tas: https://atmos.uw.edu/~wperkins/nobackup/lmr_data/data/model/ccsm4_last_millenium/tas_sfc_Amon_CCSM4_past1000_085001-185012.nc
+prior_regrid_nlat: 42
+prior_regrid_nlon: 63
+prior_time_name: time
+proxydb_path: /app/lipd_cfr.pkl
+psm_calib_period:
+- 1850
+- 2015
+ptype_clim_dict:
+  coral.SrCa:
+  - tas
+  coral.d18O:
+  - tas
+  ice.d18O:
+  - tas
+  ice.dD:
+  - tas
+  lake.varve_thickness:
+  - tas
+  tree.MXD:
+  - tas
+  tree.TRW:
+  - tas
+  - pr
+ptype_forward_dict: {}
+ptype_psm_dict:
+  coral.SrCa: Linear
+  coral.d18O: Linear
+  ice.d18O: Linear
+  ice.dD: Linear
+  lake.varve_thickness: Linear
+  tree.MXD: Linear
+  tree.TRW: Bilinear
+ptype_season_dict:
+  coral.SrCa:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  coral.d18O:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  ice.d18O:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  ice.dD:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  lake.varve_thickness:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  tree.MXD:
+  - - 6
+    - 7
+    - 8
+  - - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+  - - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+  - - -12
+    - 1
+    - 2
+  - - -9
+    - -10
+    - -11
+    - -12
+    - 1
+    - 2
+  - - -12
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+  tree.TRW:
+  - - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+  - - 6
+    - 7
+    - 8
+  - - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+  - - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+  - - -12
+    - 1
+    - 2
+  - - -9
+    - -10
+    - -11
+    - -12
+    - 1
+    - 2
+  - - -12
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+recon_loc_rad: 25000
+recon_period:
+- 850
+- 2020
+recon_sampling_mode: fixed
+recon_seeds:
+- 1
+recon_timescale: 1
+recon_vars:
+- tas
+save_dirpath: /recons
+trim_prior: true

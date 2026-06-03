@@ -1,0 +1,97 @@
+cff-version: 1.2.0
+message: "If you use this reconstruction, please cite the references below."
+title: "The Paleoclimate Reconstruction Storehouse (PReSto) platform"
+type: software
+authors:
+  - family-names: Edge
+    given-names: Dave
+  - family-names: Erb
+    given-names: Michael
+  - family-names: McKay
+    given-names: Nicholas
+  - family-names: Zhu
+    given-names: Feng
+  - family-names: Khider
+    given-names: Deborah
+  - family-names: Emile-Geay
+    given-names: Julien
+  - family-names: Routson
+    given-names: Cody
+doi: 10.5281/zenodo.8274756
+version: alpha-release
+date-released: "2023-08-25"
+url: "https://zenodo.org/record/8274756"
+references:
+  - type: article
+    title: "Last Millennium Reanalysis with an expanded proxy database and seasonal proxy modeling"
+    authors:
+      - family-names: Tardif
+        given-names: R.
+      - family-names: Hakim
+        given-names: G. J.
+      - family-names: Perkins
+        given-names: W. A.
+      - family-names: Horlick
+        given-names: K. A.
+      - family-names: Erb
+        given-names: M. P.
+      - family-names: Emile-Geay
+        given-names: J.
+      - family-names: Noone
+        given-names: D.
+    journal: "Climate of the Past"
+    volume: 15
+    issue: 4
+    start: 1251
+    end: 1273
+    year: 2019
+    doi: 10.5194/cp-15-1251-2019
+  - type: article
+    title: "The last millennium climate reanalysis project: Framework and first results"
+    authors:
+      - family-names: Hakim
+        given-names: G. J.
+      - family-names: Emile-Geay
+        given-names: J.
+      - family-names: Steig
+        given-names: E. J.
+      - family-names: Noone
+        given-names: D.
+      - family-names: Anderson
+        given-names: D. M.
+      - family-names: Tardif
+        given-names: R.
+      - family-names: Steiger
+        given-names: N.
+      - family-names: Perkins
+        given-names: W. A.
+    journal: "Journal of Geophysical Research: Atmospheres"
+    volume: 121
+    start: 6745
+    end: 6764
+    year: 2016
+    doi: 10.1002/2016JD024751
+  - type: article
+    title: "cfr (v2024.1.26): a Python package for climate field reconstruction"
+    authors:
+      - family-names: Zhu
+        given-names: F.
+      - family-names: Emile-Geay
+        given-names: J.
+      - family-names: Hakim
+        given-names: G. J.
+      - family-names: Guillot
+        given-names: D.
+      - family-names: Khider
+        given-names: D.
+      - family-names: Tardif
+        given-names: R.
+      - family-names: Perkins
+        given-names: W. A.
+    journal: "Geoscientific Model Development"
+    volume: 17
+    issue: 8
+    start: 3409
+    end: 3431
+    year: 2024
+    doi: 10.5194/gmd-17-3409-2024

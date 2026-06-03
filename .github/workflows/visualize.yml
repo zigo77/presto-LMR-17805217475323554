@@ -1,0 +1,476 @@
+name: Visualize Latest CFR Results
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Specific CFR run ID to visualize (default: latest run with an artifact)'
+        required: false
+        type: string
+      validation_only:
+        description: 'Run validation only (skip 90-min presto-viz)'
+        required: false
+        type: boolean
+        default: false
+  workflow_run:
+    workflows: ["LMR CFR Reconstruction"]
+    types: [completed]
+
+jobs:
+  find-latest-cfr-run:
+    name: Find Latest CFR Run
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch'
+    outputs:
+      run_number: ${{ steps.get_run.outputs.run_number }}
+      run_id: ${{ steps.get_run.outputs.run_id }}
+      artifact_name: ${{ steps.get_run.outputs.artifact_name }}
+
+    steps:
+        - name: Find CFR run and artifact
+          id: get_run
+          env:
+            GH_TOKEN: ${{ github.token }}
+          run: |
+            if [ "${{ github.event_name }}" = "workflow_run" ]; then
+              run_id="${{ github.event.workflow_run.id }}"
+              run_number="${{ github.event.workflow_run.run_number }}"
+            elif [ -n "${{ inputs.run_id }}" ]; then
+              run_id="${{ inputs.run_id }}"
+              run_number=$(gh api \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${{ github.repository }}/actions/runs/${run_id}" \
+                --jq '.run_number')
+            else
+              # Latest run (any conclusion) that still has an lmr-reconstruction artifact.
+              # The reconstruction workflow can "fail" on its final commit step while the
+              # artifact upload earlier in the job succeeded — we still want to visualize.
+              run_id=$(gh api \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${{ github.repository }}/actions/artifacts?per_page=50" \
+                --jq '[.artifacts[] | select(.name | startswith("lmr-reconstruction-")) | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id')
+              run_number=$(gh api \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${{ github.repository }}/actions/runs/${run_id}" \
+                --jq '.run_number')
+            fi
+
+            if [ "$run_id" = "null" ] || [ -z "$run_id" ]; then
+              echo "Error: No successful CFR runs found"
+              exit 1
+            fi
+
+            artifact_name="lmr-reconstruction-${run_id}"
+            echo "run_id=$run_id" >> $GITHUB_OUTPUT
+            echo "run_number=$run_number" >> $GITHUB_OUTPUT
+            echo "artifact_name=$artifact_name" >> $GITHUB_OUTPUT
+
+  download-cfr-artifact:
+    name: Download CFR Artifact
+    needs: find-latest-cfr-run
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+
+    steps:
+      - name: Download artifact from CFR run
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.find-latest-cfr-run.outputs.artifact_name }}
+          path: ./cfr-data
+          run-id: ${{ needs.find-latest-cfr-run.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify downloaded files
+        run: |
+          echo "Downloaded CFR artifacts:"
+          ls -lh ./cfr-data/
+          echo ""
+          echo "Checking subdirectories:"
+          find ./cfr-data -type f -name "*.nc" | head -20
+
+      - name: Flatten directory structure
+        run: |
+          echo "Flattening directory structure for presto-viz..."
+          # Find all .nc files and move them to cfr-data root
+          find ./cfr-data -type f -name "*.nc" -exec mv {} ./cfr-data/ \;
+          # Remove empty subdirectories
+          find ./cfr-data -type d -empty -delete
+          echo ""
+          echo "Files after flattening:"
+          ls -lh ./cfr-data/
+
+      - name: Re-upload for presto-viz
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfr-data-for-viz-${{ github.run_number }}
+          path: ./cfr-data/
+          retention-days: 7
+
+  validate:
+    name: Run Validation
+    needs: [find-latest-cfr-run, download-cfr-artifact]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download CFR data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cfr-data-for-viz-${{ github.run_number }}
+          path: ./cfr-data
+
+      - name: Download proxy comparison data
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: lipd-cfr-data-${{ needs.find-latest-cfr-run.outputs.run_id }}
+          path: ./prepare-data
+          run-id: ${{ needs.find-latest-cfr-run.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify reconstruction data
+        run: |
+          echo "Available NetCDF files:"
+          ls -lh ./cfr-data/*.nc
+          echo ""
+          echo "Proxy comparison data:"
+          ls -lh ./prepare-data/proxy_db_comparison.csv 2>/dev/null || echo "  (not available)"
+
+      - name: Pull Docker image
+        run: docker pull davidedge/lmr2:latest
+
+      # Proxy-database comparison vs PReSto2k. Produces comparison.json +
+      # temporal-coverage PNGs + spatial map + per-compilation CSVs under
+      # /validation, which validate_recon.py then consumes for the
+      # collapsible "Proxy Database vs PReSto2k" section. The custom
+      # pickle lands in ./prepare-data/ (from the lipd-cfr-data artifact).
+      - name: Generate proxy comparison vs PReSto2k
+        continue-on-error: true
+        run: |
+          if [ ! -f ./prepare-data/lipd_cfr.pkl ]; then
+            echo "lipd_cfr.pkl not present — skipping comparison"
+            exit 0
+          fi
+          if [ ! -f ./proxy_data/presto2k_pdb.pkl ]; then
+            echo "presto2k_pdb.pkl not present in repo — skipping comparison"
+            exit 0
+          fi
+          SKIPPED_MOUNT=""; SKIPPED_ARG=""
+          if [ -f "./prepare-data/skipped_records.csv" ]; then
+            SKIPPED_MOUNT="-v $(pwd)/prepare-data/skipped_records.csv:/app/prepare-data/skipped_records.csv:ro"
+            SKIPPED_ARG="--skipped /app/prepare-data/skipped_records.csv"
+          fi
+          QP_MOUNT=""; QP_ARG=""
+          if [ -f "./query_params.json" ]; then
+            QP_MOUNT="-v $(pwd)/query_params.json:/app/query_params.json:ro"
+            QP_ARG="--query-params /app/query_params.json"
+          fi
+          mkdir -p ./validation
+          docker run --rm \
+            -v $(pwd)/scripts/compare_to_presto2k.py:/app/compare_to_presto2k.py:ro \
+            -v $(pwd)/prepare-data/lipd_cfr.pkl:/app/lipd_cfr.pkl:ro \
+            -v $(pwd)/proxy_data/presto2k_pdb.pkl:/app/presto2k_pdb.pkl:ro \
+            -v $(pwd)/cfr-data:/recons:ro \
+            -v $(pwd)/validation:/validation \
+            ${SKIPPED_MOUNT} ${QP_MOUNT} \
+            -w /app \
+            davidedge/lmr2:latest \
+            conda run -n cfr-env python compare_to_presto2k.py \
+              --custom-pickle /app/lipd_cfr.pkl \
+              --presto2k      /app/presto2k_pdb.pkl \
+              --recon         /recons/job_r01_recon.nc \
+              ${QP_ARG} ${SKIPPED_ARG} \
+              --out-dir       /validation
+
+      # When the upstream lipd-cfr-data artifact has expired beyond its
+      # retention window, the comparison-generation step above silently
+      # no-ops and this run produces no comparison.json. Recover the
+      # comparison data (comparison.json + PNGs + per-compilation CSVs)
+      # from the most recent validation-output artifact that has it, so
+      # validate_recon.py can render the "Proxy Database vs PReSto2k"
+      # section.
+      - name: Recover comparison data from latest prior validation artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ./validation
+          if [ -f ./validation/comparison.json ]; then
+            echo "comparison.json present from this run — no recovery needed"
+            exit 0
+          fi
+          echo "comparison.json missing — searching prior validation artifacts ..."
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name | startswith("validation-output-")) | select(.expired == false)] | sort_by(.created_at) | reverse | .[] | "\(.workflow_run.id) \(.name)"' > /tmp/validation_artifacts.txt
+          while read -r run_id name; do
+            [ -z "$run_id" ] && continue
+            rm -rf /tmp/recover && mkdir -p /tmp/recover
+            if gh run download "$run_id" \
+                 --repo "${{ github.repository }}" \
+                 --name "$name" \
+                 --dir /tmp/recover > /dev/null 2>&1 && \
+               [ -f /tmp/recover/comparison.json ]; then
+              echo "Recovered comparison.json from $name (run $run_id)"
+              cp /tmp/recover/comparison.json ./validation/
+              for f in temporal_coverage_archive.png temporal_coverage_ptype.png spatial_map_comparison.png; do
+                [ -f "/tmp/recover/$f" ] && cp "/tmp/recover/$f" ./validation/
+              done
+              find /tmp/recover -maxdepth 1 -name "*.csv" -exec cp {} ./validation/ \;
+              rm -rf /tmp/recover
+              break
+            fi
+          done < /tmp/validation_artifacts.txt
+          if [ ! -f ./validation/comparison.json ]; then
+            echo "No prior validation artifact had comparison.json — comparison section will be omitted."
+          fi
+
+      - name: Run validation script
+        run: |
+          COMPARISON_MOUNT=""
+          if [ -f "./prepare-data/proxy_db_comparison.csv" ]; then
+            COMPARISON_MOUNT="-v $(pwd)/prepare-data/proxy_db_comparison.csv:/app/proxy_db_comparison.csv:ro"
+          fi
+          docker run --rm \
+            -v $(pwd)/validate_recon.py:/app/validate_recon.py:ro \
+            -v $(pwd)/cfr-data:/recons:ro \
+            -v $(pwd)/reference_data:/reference_data:ro \
+            -v $(pwd)/validation:/validation \
+            ${COMPARISON_MOUNT} \
+            -e RECON_DIR=/recons \
+            -e VALIDATION_DIR=/validation \
+            -e LMR_V21_PATH=/reference_data/gmt_MCruns_ensemble_full_LMRv2.1.nc \
+            -e COMPARISON_CSV=/app/proxy_db_comparison.csv \
+            -e COMPARISON_JSON=/validation/comparison.json \
+            davidedge/lmr2:latest \
+            conda run -n cfr-env python /app/validate_recon.py
+
+      - name: Upload validation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-output-${{ github.run_number }}
+          path: ./validation/
+          retention-days: 30
+
+  visualize:
+    name: Generate Presto Visualization
+    needs: [find-latest-cfr-run, download-cfr-artifact]
+    if: inputs.validation_only != true
+    # uses: DaveEdge1/presto-viz/.github/workflows/presto-viz-reusable.yml@fix/cfr-dimension-order
+    uses: DaveEdge1/presto-viz/.github/workflows/presto-viz-reusable.yml@main
+    with:
+      reconstruction_id: CFR_Run_${{ needs.find-latest-cfr-run.outputs.run_number }}_Reviz_${{ github.run_number }}
+      artifact_name: cfr-data-for-viz-${{ github.run_number }}
+
+  deploy-to-github-pages:
+    name: Deploy to GitHub Pages
+    needs: [find-latest-cfr-run, visualize, validate]
+    # Deploy when either the visualizer was rebuilt this run OR we're in
+    # validation-only mode and validation succeeded. In the latter case we
+    # recover the most recent presto-viz artifact below so the deployed
+    # site keeps its visualizer tile.
+    if: always() && (needs.visualize.result == 'success' || (needs.visualize.result == 'skipped' && needs.validate.result == 'success'))
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download visualization artifact (this run)
+        if: needs.visualize.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: presto-viz-output-CFR_Run_${{ needs.find-latest-cfr-run.outputs.run_number }}_Reviz_${{ github.run_number }}
+          path: ./visualization-output
+
+      - name: Recover visualizer from latest prior run (validation-only mode)
+        if: needs.visualize.result != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ./visualization-output
+          # validation_only=true skips the visualize job, so this run
+          # produced no fresh viz artifact. Pull the most recent unexpired
+          # presto-viz artifact from any prior run so the deployed Pages
+          # site keeps its existing visualizer alongside the newly
+          # regenerated validation page.
+          LATEST=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name | startswith("presto-viz-output-")) | select(.expired == false)] | sort_by(.created_at) | reverse | .[0] | "\(.workflow_run.id) \(.name)"')
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            echo "No prior visualizer artifact in retention window; deploying validation-only (no visualizer tile)."
+            exit 0
+          fi
+          ART_RUN=$(echo "$LATEST" | awk '{print $1}')
+          ART_NAME=$(echo "$LATEST" | cut -d' ' -f2-)
+          echo "Recovering visualizer from $ART_NAME (run $ART_RUN)"
+          gh run download "$ART_RUN" \
+            --repo "${{ github.repository }}" \
+            --name "$ART_NAME" \
+            --dir ./visualization-output
+
+      - name: Download validation artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: validation-output-${{ github.run_number }}
+          path: ./visualization-output/validation
+
+      - name: Prepare Pages content
+        run: |
+          find ./visualization-output -type f -name "*.zip" -delete
+          if [ -d "visualization-output/viz" ]; then
+            mv visualization-output/viz visualization-output/docs
+          fi
+
+          # Copy icon images (committed to repo) into the deployment
+          mkdir -p ./visualization-output/images
+          cp images/visualization.png images/validation.png ./visualization-output/images/ 2>/dev/null || true
+
+          # Conditionally include the validation tile
+          VALIDATION_TILE=""
+          if [ -f "./visualization-output/validation/index.html" ]; then
+            VALIDATION_TILE='<a class="tile" href="validation/index.html"><img src="images/validation.png" alt="Reconstruction Validation"><span>Reconstruction Validation</span></a>'
+          fi
+
+          # Conditionally include the visualization tile
+          VIZ_TILE=""
+          if [ -f "./visualization-output/docs/visualizer.html" ]; then
+            VIZ_TILE='<a class="tile" href="docs/visualizer.html"><img src="images/visualization.png" alt="Visualize Results"><span>Visualize Results</span></a>'
+          fi
+
+          cat > ./visualization-output/index.html << HTMLEOF
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Last Millenium Reanalysis - PReSto Custom</title>
+            <style>
+              :root {
+                --bg: #f7f8fa;
+                --fg: #1a1a1a;
+                --accent: #2563eb;
+                --tile-bg: #ffffff;
+                --tile-shadow: 0 2px 8px rgba(0,0,0,0.08);
+                --tile-shadow-hover: 0 6px 18px rgba(0,0,0,0.14);
+              }
+              * { box-sizing: border-box; }
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background: var(--bg);
+                color: var(--fg);
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+              }
+              header {
+                text-align: center;
+                padding: 48px 24px 24px;
+              }
+              header h1 {
+                margin: 0;
+                font-size: 2rem;
+                font-weight: 600;
+                color: var(--fg);
+              }
+              main {
+                flex: 1;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                padding: 24px;
+              }
+              .tiles {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 32px;
+                justify-content: center;
+              }
+              .tile {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: flex-start;
+                width: clamp(240px, 32vw, 480px);
+                padding: clamp(20px, 2.5vw, 40px);
+                background: var(--tile-bg);
+                border-radius: 12px;
+                box-shadow: var(--tile-shadow);
+                text-decoration: none;
+                color: var(--fg);
+                transition: transform 0.15s ease, box-shadow 0.15s ease;
+              }
+              .tile:hover {
+                transform: translateY(-3px);
+                box-shadow: var(--tile-shadow-hover);
+              }
+              .tile img {
+                width: 100%;
+                height: clamp(160px, 22vw, 360px);
+                object-fit: contain;
+                margin-bottom: 20px;
+              }
+              .tile span {
+                font-size: clamp(1.1rem, 1.6vw, 1.5rem);
+                font-weight: 500;
+                color: var(--accent);
+                text-align: center;
+              }
+              footer {
+                text-align: center;
+                padding: 32px 24px 40px;
+              }
+              footer img {
+                max-width: 180px;
+                height: auto;
+                opacity: 0.85;
+              }
+            </style>
+          </head>
+          <body>
+            <header>
+              <h1>Last Millenium Reanalysis - PReSto Custom</h1>
+            </header>
+            <main>
+              <div class="tiles">
+                ${VALIDATION_TILE}
+                ${VIZ_TILE}
+              </div>
+            </main>
+            <footer>
+              <img src="docs/assets/logo.png" alt="PReSto logo">
+            </footer>
+          </body>
+          </html>
+          HTMLEOF
+
+          ls -lah ./visualization-output/
+          ls -lah ./visualization-output/images/ 2>/dev/null || true
+          ls -lah ./visualization-output/validation/ 2>/dev/null || echo "No validation output"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact to Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./visualization-output
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+

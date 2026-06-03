@@ -1,0 +1,214 @@
+name: Release Reconstruction
+
+# Bundles every successful reconstruction into a GitHub Release so the
+# scientific record survives long after Actions artifacts expire. The
+# release captures the proxy database that was actually assimilated
+# (lipd_cfr.pkl), the reconstruction NetCDFs, the validation page +
+# proxy-comparison data, and the input configs that produced the run.
+#
+# Triggers on a successful "Visualize Latest CFR Results" run so that
+# both the recon outputs and the validation/comparison data are ready
+# at the same time. Skips if a release already exists for the source
+# cfr-custom run ID — so re-running visualize in validation_only mode
+# never creates a duplicate release.
+
+on:
+  workflow_run:
+    workflows: ["Visualize Latest CFR Results"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      cfr_run_id:
+        description: 'cfr-custom run ID to release (default: latest successful)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    name: Bundle reconstruction into a GitHub Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve cfr-custom run ID
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.cfr_run_id }}" ]; then
+            CFR_RUN_ID="${{ inputs.cfr_run_id }}"
+          else
+            # The lmr-reconstruction-<id> artifact is uploaded by cfr-custom.yml.
+            # Take the most recent unexpired one as the source of truth.
+            CFR_RUN_ID=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+              --jq '[.artifacts[] | select(.name | startswith("lmr-reconstruction-")) | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id')
+          fi
+          if [ -z "$CFR_RUN_ID" ] || [ "$CFR_RUN_ID" = "null" ]; then
+            echo "ERROR: could not resolve a cfr-custom run ID"
+            exit 1
+          fi
+          CFR_RUN_NUMBER=$(gh api \
+            "/repos/${{ github.repository }}/actions/runs/${CFR_RUN_ID}" \
+            --jq '.run_number')
+          TAG="recon-${CFR_RUN_ID}"
+          echo "cfr_run_id=${CFR_RUN_ID}" >> $GITHUB_OUTPUT
+          echo "cfr_run_number=${CFR_RUN_NUMBER}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Skip if release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.resolve.outputs.tag }}" \
+               --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.resolve.outputs.tag }} already exists — skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download reconstruction artifact
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ./bundle/recons
+          gh run download "${{ steps.resolve.outputs.cfr_run_id }}" \
+            --repo "${{ github.repository }}" \
+            --name "lmr-reconstruction-${{ steps.resolve.outputs.cfr_run_id }}" \
+            --dir ./bundle/recons
+
+      - name: Download proxy database artifact
+        if: steps.existing.outputs.skip != 'true'
+        # Fail-soft: lipd-cfr-data artifacts uploaded before the
+        # retention bump (7→90 days) are gone after a week. We still
+        # want the release to capture the NetCDFs and validation
+        # bundle even when the proxy pickle is unrecoverable.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ./bundle/proxy
+          if gh run download "${{ steps.resolve.outputs.cfr_run_id }}" \
+               --repo "${{ github.repository }}" \
+               --name "lipd-cfr-data-${{ steps.resolve.outputs.cfr_run_id }}" \
+               --dir ./bundle/proxy 2>/dev/null; then
+            echo "lipd-cfr-data recovered:"
+            ls -lh ./bundle/proxy/
+          else
+            echo "lipd-cfr-data artifact unavailable (likely expired) — release will note its absence."
+          fi
+
+      - name: Recover validation + comparison artifact
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ./bundle/validation
+          # The validate job uploads validation-output-<run_number> where
+          # run_number is the visualize.yml run number, not cfr-custom's.
+          # Use the most recent unexpired one — for an auto-trigger run
+          # it's the visualize run that just finished.
+          LATEST=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name | startswith("validation-output-")) | select(.expired == false)] | sort_by(.created_at) | reverse | .[0] | "\(.workflow_run.id) \(.name)"')
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            echo "No validation-output artifact found — releasing without validation bundle."
+            exit 0
+          fi
+          ART_RUN=$(echo "$LATEST" | awk '{print $1}')
+          ART_NAME=$(echo "$LATEST" | cut -d' ' -f2-)
+          echo "Bundling validation from $ART_NAME (run $ART_RUN)"
+          gh run download "$ART_RUN" \
+            --repo "${{ github.repository }}" \
+            --name "$ART_NAME" \
+            --dir ./bundle/validation
+
+      - name: Stage input configs and README snapshot
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          mkdir -p ./bundle/inputs
+          for f in query_params.json lmr_configs.yml cleaning_report.json README.md; do
+            [ -f "$f" ] && cp "$f" ./bundle/inputs/
+          done
+          ls -lh ./bundle/inputs/
+
+      - name: Tar the validation directory
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          if [ -d ./bundle/validation ] && [ "$(ls -A ./bundle/validation)" ]; then
+            tar -czf ./bundle/validation.tar.gz -C ./bundle validation
+            ls -lh ./bundle/validation.tar.gz
+          fi
+
+      - name: Build release notes
+        if: steps.existing.outputs.skip != 'true'
+        id: notes
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          REPO_NAME="${{ github.event.repository.name }}"
+          PAGES_URL="https://${OWNER_LC}.github.io/${REPO_NAME}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ steps.resolve.outputs.cfr_run_id }}"
+          if [ -f ./bundle/proxy/lipd_cfr.pkl ]; then
+            PROXY_LINE="- \`lipd_cfr.pkl\` — the proxy database that was assimilated"
+          else
+            PROXY_LINE="- *\`lipd_cfr.pkl\` was not recoverable — the upstream artifact had already expired when this release was built. Future releases will include it (the underlying retention is now 90 days).*"
+          fi
+          {
+            echo "Reconstruction snapshot from cfr-custom run [#${{ steps.resolve.outputs.cfr_run_number }}](${RUN_URL})."
+            echo ""
+            echo "**Bundled assets**"
+            echo ""
+            echo "- \`combined_recon.nc\` / \`job_r01_recon.nc\` — reconstruction NetCDFs (Kalman-filter ensemble)"
+            echo "${PROXY_LINE}"
+            echo "- \`skipped_records.csv\`, \`proxy_type_breakdown.csv\` — pipeline drop log"
+            echo "- \`validation.tar.gz\` — full validation page (HTML + plots) + proxy-comparison data"
+            echo "- \`query_params.json\`, \`lmr_configs.yml\`, \`cleaning_report.json\`, \`README.md\` — inputs and run-context snapshot"
+            echo ""
+            echo "**Live validation page:** [${PAGES_URL}/validation/index.html](${PAGES_URL}/validation/index.html)"
+            echo ""
+            echo "Release auto-created by [release-recon.yml](.github/workflows/release-recon.yml). The proxy database (\`lipd_cfr.pkl\`) is captured here because the upstream Actions artifact has a 90-day retention; this release preserves it indefinitely."
+          } > release_notes.md
+          echo "notes_path=release_notes.md" >> $GITHUB_OUTPUT
+
+      - name: Create release
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Flatten asset paths so the release attaches files at top level.
+          ASSETS=()
+          for path in \
+              ./bundle/recons/job_r01_recon.nc \
+              ./bundle/recons/combined_recon.nc \
+              ./bundle/proxy/lipd_cfr.pkl \
+              ./bundle/proxy/prepare-data/skipped_records.csv \
+              ./bundle/proxy/prepare-data/proxy_type_breakdown.csv \
+              ./bundle/validation.tar.gz \
+              ./bundle/inputs/query_params.json \
+              ./bundle/inputs/lmr_configs.yml \
+              ./bundle/inputs/cleaning_report.json \
+              ./bundle/inputs/README.md \
+          ; do
+            if [ -f "$path" ]; then
+              ASSETS+=("$path")
+            fi
+          done
+          echo "Attaching ${#ASSETS[@]} files:"
+          printf '  %s\n' "${ASSETS[@]}"
+          gh release create "${{ steps.resolve.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "Reconstruction #${{ steps.resolve.outputs.cfr_run_number }} (run ${{ steps.resolve.outputs.cfr_run_id }})" \
+            --notes-file release_notes.md \
+            "${ASSETS[@]}"

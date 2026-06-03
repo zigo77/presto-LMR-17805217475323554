@@ -1,0 +1,105 @@
+name: Update README
+
+# Regenerates README.md from query_params.json + lmr_configs.yml so the
+# repo's landing page reflects the run-specific data selection and
+# reconstruction parameters instead of the verbatim template README.
+#
+# Triggers on a successful "LMR CFR Reconstruction" workflow run, or on
+# manual dispatch (useful after editing lmr_configs.yml without re-running
+# the full reconstruction).
+#
+# ── Workflow ecosystem ────────────────────────────────────────────────
+#   cfr-custom.yml      : runs the reconstruction (prepare-data + reconstruct)
+#   visualize.yml       : builds the visualizer + validation page
+#   release-recon.yml   : bundles each successful run into a GitHub Release
+#   update-readme.yml   : (this file) keeps README.md in sync with inputs
+#
+# ── Release objects (release-recon.yml) ───────────────────────────────
+# Every successful cfr-custom + visualize cycle is bundled into a tagged
+# GitHub Release named `recon-<cfr_run_id>` that preserves the
+# scientific record indefinitely (Actions artifacts have at most 90-day
+# retention). Each release attaches:
+#
+#   combined_recon.nc, job_r01_recon.nc  reconstruction NetCDFs (KF ensemble)
+#   lipd_cfr.pkl                         proxy database that was assimilated
+#   skipped_records.csv,                 records dropped by the prepare-data
+#     proxy_type_breakdown.csv             pipeline (PSM calibration etc.)
+#   validation.tar.gz                    validation HTML + GMST/spatial plots
+#                                          + comparison.json + per-compilation
+#                                          CSVs (proxy-database vs PReSto2k)
+#   query_params.json, lmr_configs.yml,  inputs and run-context snapshot
+#     cleaning_report.json, README.md
+#
+# release-recon.yml is idempotent: a recon-<run_id> release is created
+# at most once. If a release was created before the lipd-cfr-data
+# retention bump (7→90 days) and is missing lipd_cfr.pkl, refresh it
+# with:
+#   gh workflow run cfr-custom.yml --ref main -f prepare_only=true
+# then `gh release upload recon-<run_id> lipd_cfr.pkl ...`.
+#
+# ── GitHub-Zenodo integration (optional) ──────────────────────────────
+# Releases produced by release-recon.yml can be auto-archived to Zenodo
+# with citable DOIs. To enable on a custom recon repo:
+#   1. Sign in at https://zenodo.org/account/settings/github/ with the
+#      repo owner's GitHub account.
+#   2. Toggle the switch next to this repository to "On". Zenodo
+#      installs a webhook that fires on every release.
+#   3. Cut a release (or trigger release-recon.yml). Zenodo mints a
+#      version DOI for the release and a stable concept DOI for the
+#      repo as a whole.
+#   4. Optionally add a DOI badge to README_NOTES.md so it appears at
+#      the top of the auto-generated README:
+#        [![DOI](https://zenodo.org/badge/DOI/<concept_doi>.svg)](https://doi.org/<concept_doi>)
+# This is a one-time per-repo setup; no workflow changes are required.
+
+on:
+  workflow_run:
+    workflows: ["LMR CFR Reconstruction"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate-readme:
+    name: Regenerate README from query_params.json + lmr_configs.yml
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Regenerate README.md
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          REPO_NAME="${{ github.event.repository.name }}"
+          PAGES_URL="https://${OWNER_LC}.github.io/${REPO_NAME}/"
+          RELEASES_URL="${{ github.server_url }}/${{ github.repository }}/releases"
+          python scripts/generate_readme.py \
+            --pages-url "${PAGES_URL}" \
+            --releases-url "${RELEASES_URL}"
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add README.md
+          if git diff --staged --quiet; then
+            echo "README.md is already up to date."
+            exit 0
+          fi
+          git commit -m "Regenerate README from query_params.json + lmr_configs.yml"
+          git push

@@ -1,0 +1,46 @@
+recon_period:
+  - 850
+  - 2020
+recon_seeds:
+  - 1
+prior_annualize_months:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+prior_anom_period:
+  - 850
+  - 1850
+assim_frac: 0.75
+nens: 100
+recon_loc_rad: 25000
+proxydb_path: /app/lipd_cfr.pkl
+save_dirpath: /recons
+
+# Archive / ptype whitelist — matches PReSto2k's coverage. cfr assigns a
+# Linear PSM with [tas] input by default for ptypes not in ptype_psm_dict,
+# so the five extra archives (marine, sclerosponge, speleothem, borehole,
+# documents, hybrid) calibrate on tas alone. Records that fail PSM
+# calibration (too little instrumental overlap) drop out naturally.
+filter_proxydb_kwargs:
+  by: ptype
+  keys:
+  - coral
+  - tree
+  - ice
+  - lake
+  - bivalve
+  - marine
+  - sclerosponge
+  - speleothem
+  - borehole
+  - documents
+  - hybrid

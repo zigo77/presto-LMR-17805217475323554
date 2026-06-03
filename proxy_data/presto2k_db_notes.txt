@@ -1,0 +1,1 @@
+lipd data curated from coralhydro2k, iso2k, and pages2k by Tanaya Gondhalekar for presto2k. See details ithis repo: https://github.com/LinkedEarth/presto2k_cfr_pb

@@ -1,0 +1,425 @@
+name: LMR CFR Reconstruction
+
+on:
+  push:
+    paths:
+      - 'query_params.json'   # not in template; server commits this LAST so all files are present
+      - 'lipd_cfr.pkl'        # pre-built cfr ProxyDatabase; commit to trigger reconstruction
+  workflow_dispatch:
+    inputs:
+      unique_id:
+        description: 'Unique reconstruction ID'
+        required: false
+        type: string
+      lipd_data_url:
+        description: 'URL to pre-generated LiPD pickle (traditional pathway)'
+        required: false
+        type: string
+      lipd_query_json:
+        description: 'LiPD data query parameters for workflow generation (dispatch pathway)'
+        required: false
+        type: string
+      prepare_only:
+        description: 'Run only data prep (skip reconstruct). Use to refresh lipd_cfr.pkl for an existing release without redoing the full Kalman filter run.'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  # ── Job 1: Acquire and convert proxy data ─────────────────────────────────
+  # Uploads lipd_cfr.pkl as an artifact so Job 2 can be re-run independently
+  # when only the CFR reconstruction step needs debugging.
+  prepare-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    permissions:
+      # Bumped from read → write so citation files can be committed to repo root.
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Detect which pathway to use.
+      # Priority order:
+      #   0. lipd_cfr.pkl in repo       — pre-built cfr ProxyDatabase (skip all generation)
+      #   1. query_params.json in repo  — server-committed (push trigger pathway)
+      #   2. lipd_data_url input        — traditional pre-generated pickle
+      #   3. lipd_query_json input      — manual workflow_dispatch
+      - name: Detect data acquisition pathway
+        id: pathway
+        run: |
+          if [ -f "lipd_cfr.pkl" ]; then
+            echo "pathway=prebuilt" >> $GITHUB_OUTPUT
+            echo "Using pre-built lipd_cfr.pkl from repo (skipping data generation)"
+          elif [ -f "query_params.json" ]; then
+            echo "pathway=github_actions" >> $GITHUB_OUTPUT
+            MODE=$(jq -r '.mode' query_params.json)
+            echo "mode=$MODE" >> $GITHUB_OUTPUT
+            echo "Using query_params.json from repo (mode: $MODE)"
+          elif [ -n "${{ inputs.lipd_data_url }}" ]; then
+            echo "pathway=traditional" >> $GITHUB_OUTPUT
+            echo "Using traditional pathway: download from URL"
+          elif [ -n "${{ inputs.lipd_query_json }}" ]; then
+            echo "pathway=github_actions" >> $GITHUB_OUTPUT
+            echo '${{ inputs.lipd_query_json }}' > query_params.json
+            MODE=$(jq -r '.mode' query_params.json)
+            echo "mode=$MODE" >> $GITHUB_OUTPUT
+            echo "Using lipd_query_json input (mode: $MODE)"
+          else
+            echo "ERROR: No data source found (no lipd_cfr.pkl, no query_params.json, no lipd_data_url, no lipd_query_json)"
+            exit 1
+          fi
+
+      # PREBUILT PATHWAY: lipd_cfr.pkl already in repo — nothing to do
+      - name: Use pre-built proxy database
+        if: steps.pathway.outputs.pathway == 'prebuilt'
+        run: |
+          echo "Using pre-built lipd_cfr.pkl from repository"
+          ls -lh lipd_cfr.pkl
+
+      # TRADITIONAL PATHWAY: Download from URL
+      - name: Download LiPD data from URL
+        if: steps.pathway.outputs.pathway == 'traditional'
+        run: |
+          echo "Downloading pre-generated LiPD data from: ${{ inputs.lipd_data_url }}"
+          curl -L "${{ inputs.lipd_data_url }}" -o lipd_data.pkl
+          ls -lh lipd_data.pkl
+
+      # GITHUB ACTIONS PATHWAY - PATH A: Archived Compilation (direct download)
+      - name: Download archived compilation
+        if: steps.pathway.outputs.pathway == 'github_actions' && steps.pathway.outputs.mode == 'archived'
+        run: |
+          COMPILATION=$(jq -r '.compilation' query_params.json)
+          VERSION=$(jq -r '.version' query_params.json)
+          PICKLE_URL="https://lipdverse.org/${COMPILATION}/${VERSION}/${COMPILATION}${VERSION}.pkl"
+
+          echo "Downloading archived compilation from: $PICKLE_URL"
+          curl -L -f "$PICKLE_URL" -o lipd_data.pkl || {
+            echo "ERROR: Failed to download archived compilation"
+            echo "URL: $PICKLE_URL"
+            exit 1
+          }
+
+          ls -lh lipd_data.pkl
+
+      # GITHUB ACTIONS PATHWAY - PATH B: Filtered Query (lipdGenerator Docker)
+      - name: Generate LiPD data from query
+        if: steps.pathway.outputs.pathway == 'github_actions' && steps.pathway.outputs.mode == 'filtered'
+        run: |
+          echo "Querying lipdverse and generating .lpd files using lipdGenerator container..."
+          mkdir -p lipd_output
+          docker run --rm \
+            -v $(pwd)/query_params.json:/query_params.json:ro \
+            -v $(pwd)/lipd_output:/output \
+            davidedge/lipd_webapps:lipdGenerator /query_params.json /output lpd
+
+          if [ ! -f lipd_output/lipd_files.zip ]; then
+            echo "ERROR: lipdGenerator did not produce lipd_files.zip"
+            ls -la lipd_output/ || true
+            exit 1
+          fi
+
+          echo "lipd_files.zip ready:"
+          ls -lh lipd_output/lipd_files.zip
+
+      - name: Verify LiPD data created
+        if: steps.pathway.outputs.pathway != 'prebuilt'
+        run: |
+          if [ -f lipd_data.pkl ] || [ -f lipd_output/lipd_files.zip ]; then
+            echo "LiPD data ready"
+            ls -lh lipd_data.pkl lipd_output/lipd_files.zip 2>/dev/null || true
+          else
+            echo "ERROR: No LiPD data found (expected lipd_data.pkl or lipd_output/lipd_files.zip)"
+            exit 1
+          fi
+
+      # Citations are extracted from the SOURCE data (.zip or legacy .pkl)
+      # BEFORE the CFR conversion below, because the converted lipd_cfr.pkl is
+      # a flattened DataFrame that no longer carries pub metadata.
+      # Skipped on prebuilt pathway (no source data to read pubs from).
+      - name: Generate citation files
+        if: steps.pathway.outputs.pathway != 'prebuilt'
+        run: |
+          RECON_ID="${{ inputs.unique_id }}"
+          [ -z "$RECON_ID" ] && RECON_ID=$(jq -r '.uniqueID // empty' query_params.json 2>/dev/null || echo "")
+          [ -z "$RECON_ID" ] && RECON_ID="${{ github.run_id }}"
+          mkdir -p citations_out
+
+          # If the repo already has a curated CITATION.cff (e.g. the platform-
+          # level CFF in the LMR2 template), merge a data-source addendum into
+          # it instead of overwriting. Bash-conditional mount keeps the docker
+          # command clean when no existing CFF is present.
+          MERGE_FLAG=""
+          EXTRA_MOUNT=""
+          if [ -f CITATION.cff ]; then
+            EXTRA_MOUNT="-v $(pwd)/CITATION.cff:/existing_cff/CITATION.cff:ro"
+            MERGE_FLAG="--merge-cff=/existing_cff/CITATION.cff"
+            echo "Existing CITATION.cff detected — will merge addendum"
+          fi
+
+          if [ -f lipd_output/lipd_files.zip ]; then
+            docker run --rm \
+              -v "$(pwd)/lipd_output/lipd_files.zip:/data/lipd_files.zip:ro" \
+              -v "$(pwd)/citations_out:/citations_out" \
+              $EXTRA_MOUNT \
+              davidedge/lipd_webapps:lipdGenerator \
+              citations /data/lipd_files.zip /citations_out \
+              --title="LMR Reconstruction $RECON_ID" \
+              --url="https://github.com/${{ github.repository }}" \
+              --unique-id="$RECON_ID" \
+              --author="${{ github.repository_owner }}" \
+              $MERGE_FLAG
+          elif [ -f lipd_data.pkl ]; then
+            docker run --rm \
+              -v "$(pwd)/lipd_data.pkl:/data/lipd_data.pkl:ro" \
+              -v "$(pwd)/citations_out:/citations_out" \
+              $EXTRA_MOUNT \
+              davidedge/lipd_webapps:lipdGenerator \
+              citations /data/lipd_data.pkl /citations_out \
+              --title="LMR Reconstruction $RECON_ID" \
+              --url="https://github.com/${{ github.repository }}" \
+              --unique-id="$RECON_ID" \
+              --author="${{ github.repository_owner }}" \
+              $MERGE_FLAG
+          else
+            echo "No source LiPD data found; skipping citation generation"
+          fi
+
+          ls -lh citations_out/ 2>/dev/null || true
+
+      - name: Commit citation files to repository
+        if: steps.pathway.outputs.pathway != 'prebuilt'
+        run: |
+          if [ ! -f citations_out/data_references.bib ] && [ ! -f citations_out/CITATION.cff ]; then
+            echo "No citation files generated; nothing to commit"
+            exit 0
+          fi
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          [ -f citations_out/data_references.bib ] && cp citations_out/data_references.bib data_references.bib && git add data_references.bib
+          [ -f citations_out/CITATION.cff ]        && cp citations_out/CITATION.cff        CITATION.cff        && git add CITATION.cff
+          if git diff --staged --quiet; then
+            echo "No citation file changes to commit"
+          else
+            git commit -m "Add data citations for LMR reconstruction ${{ github.run_id }}"
+            # Retry on push race — another job/run may have pushed between checkout and now.
+            for i in 1 2 3; do
+              git pull --rebase origin "${{ github.ref_name }}" && git push && break || sleep $((i*5))
+            done
+          fi
+
+      - name: Pull Docker image
+        if: steps.pathway.outputs.pathway != 'prebuilt'
+        run: docker pull davidedge/lmr2:latest
+
+      # FILTERED PATHWAY: lipd_files.zip → cfr.ProxyDatabase (direct JSON parsing, no SPARQL)
+      # query_params.json is passed so lipd_to_pdb.py can filter the extracted
+      # paleoData rows to only those TSIDs presto requested — without this,
+      # every sibling column in each .lpd (sampleCount, EPS, RBAR, alternate
+      # chronology flavors) leaks in as a pseudo-proxy.
+      - name: Convert LiPD to ProxyDatabase (filtered pathway)
+        if: steps.pathway.outputs.pathway == 'github_actions' && steps.pathway.outputs.mode == 'filtered'
+        run: |
+          echo "Converting .lpd files to cfr.ProxyDatabase using lipd_to_pdb.py ..."
+          docker run --rm \
+            -v $(pwd)/lipd_output/lipd_files.zip:/app/lipd_files.zip:ro \
+            -v $(pwd)/scripts/lipd_to_pdb.py:/app/lipd_to_pdb.py:ro \
+            -v $(pwd)/query_params.json:/app/query_params.json:ro \
+            -v $(pwd):/output \
+            -w /app \
+            davidedge/lmr2:latest \
+            conda run -n cfr-env python lipd_to_pdb.py lipd_files.zip /output/lipd_cfr.pkl query_params.json
+
+      # ARCHIVED / TRADITIONAL PATHWAY: legacy LiPD dict pickle → CFR DataFrame
+      - name: Convert LiPD format (archived/traditional pathway)
+        if: steps.pathway.outputs.pathway != 'prebuilt' && steps.pathway.outputs.mode != 'filtered'
+        run: |
+          echo "Converting LiPD pickle to CFR format using convert_lipd_to_cfr_dataframe.py ..."
+          docker run --rm \
+            -v $(pwd)/lipd_data.pkl:/app/lipd_data.pkl:ro \
+            -v $(pwd)/scripts/convert_lipd_to_cfr_dataframe.py:/app/convert_lipd_to_cfr_dataframe.py:ro \
+            -v $(pwd):/output \
+            -w /app \
+            davidedge/lmr2:latest \
+            conda run -n cfr-env python convert_lipd_to_cfr_dataframe.py lipd_data.pkl /output/lipd_cfr.pkl
+
+      - name: Verify CFR data created
+        run: |
+          if [ -f lipd_cfr.pkl ]; then
+            echo "CFR data file ready"
+            ls -lh lipd_cfr.pkl
+          else
+            echo "ERROR: lipd_cfr.pkl not found"
+            exit 1
+          fi
+
+      - name: Upload CFR data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lipd-cfr-data-${{ github.run_id }}
+          # skipped_records.csv + proxy_type_breakdown.csv feed the
+          # "Records dropped by the pipeline" section in the validation HTML.
+          path: |
+            lipd_cfr.pkl
+            prepare-data/skipped_records.csv
+            prepare-data/proxy_type_breakdown.csv
+          # 90 days matches the lmr-reconstruction retention. With 7 days,
+          # validation re-runs more than a week after a full recon would
+          # silently lose the proxy comparison block (lipd_cfr.pkl gone).
+          retention-days: 90
+
+  # ── Job 2: Run CFR reconstruction ─────────────────────────────────────────
+  # Re-run this job alone (via "Re-run failed jobs") when only CFR config
+  # changes are needed — no need to redo the 20-min data generation.
+  # Skipped entirely when workflow_dispatch input prepare_only=true, which
+  # is used to refresh the lipd-cfr-data artifact (e.g., to backfill
+  # lipd_cfr.pkl into an existing release) without spending hours on a
+  # fresh Kalman filter run.
+  reconstruct:
+    needs: prepare-data
+    if: inputs.prepare_only != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download CFR data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lipd-cfr-data-${{ github.run_id }}
+
+      - name: Pull Docker image
+        run: docker pull davidedge/lmr2:latest
+
+      - name: Create results directory
+        run: mkdir -p ./recons
+
+      # CCSM4 past1000 prior fetch — bypasses cfr's broken cache.
+      # cfr/climate.py:138 does an unguarded os.path.exists() check before
+      # downloading, so any partial file at ./data/<basename> from a network
+      # blip is silently reused. The truncated NC has a non-monotonic time
+      # axis, which crashes forward_psms with "index must be monotonic for
+      # resampling" (see eliallred22 run 25463554014). We pre-fetch with
+      # retries, validate integrity via xarray, then mount the verified
+      # files into /app/data so cfr's existence check finds clean data.
+      - name: Cache CCSM4 past1000 prior
+        id: prior-cache
+        uses: actions/cache@v4
+        with:
+          path: ./prior_data
+          key: ccsm4-past1000-pr-tas-v1
+
+      - name: Download CCSM4 prior
+        if: steps.prior-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./prior_data
+          BASE=https://atmos.uw.edu/~wperkins/nobackup/lmr_data/data/model/ccsm4_last_millenium
+          for f in pr_sfc_Amon_CCSM4_past1000_085001-185012.nc \
+                   tas_sfc_Amon_CCSM4_past1000_085001-185012.nc; do
+            echo "Downloading $f ..."
+            # --retry-all-errors retries on any failure (network, HTTP),
+            # --max-time caps each attempt, --fail surfaces non-2xx as exit
+            # nonzero so the retry actually fires. No -C - (resume) — a
+            # restart-from-zero is what we want when the partial file is the
+            # corruption source.
+            curl -L --fail --retry 8 --retry-delay 30 --retry-all-errors \
+                 --max-time 1800 \
+                 -o ./prior_data/$f \
+                 $BASE/$f
+            sz=$(stat -c%s ./prior_data/$f)
+            echo "$f : $sz bytes"
+            # CCSM4 past1000 files are ~2.47 GB. Anything under 2 GB is a
+            # truncated download — reject early before xarray validation.
+            if [ "$sz" -lt 2000000000 ]; then
+              echo "ERROR: $f is only $sz bytes; expected ~2.47 GB"
+              rm -f ./prior_data/$f
+              exit 1
+            fi
+          done
+
+      - name: Validate prior NetCDF integrity
+        # Runs on every job (cache-hit included) so a corrupted cache cannot
+        # silently feed bad data into the recon. Opens both NCs the same way
+        # cfr does (xarray + use_cftime=True) and asserts the time axis is
+        # strictly monotonic and covers 850-1850 CE. If this fails after a
+        # cache hit, clear the cache via the Actions UI and re-run.
+        run: |
+          docker run --rm \
+            -v $(pwd)/prior_data:/data:ro \
+            davidedge/lmr2:latest \
+            python -c "
+          import sys, xarray as xr
+          ok = True
+          for f in [
+              '/data/pr_sfc_Amon_CCSM4_past1000_085001-185012.nc',
+              '/data/tas_sfc_Amon_CCSM4_past1000_085001-185012.nc',
+          ]:
+              ds = xr.open_dataset(f, use_cftime=True)
+              t = ds['time'].values
+              monotonic = all(b > a for a, b in zip(t[:-1], t[1:]))
+              yrs = [x.year for x in t]
+              y0, y1 = min(yrs), max(yrs)
+              if not monotonic:
+                  print(f'FAIL {f}: time axis is not monotonic'); ok = False
+              elif y0 > 850 or y1 < 1850:
+                  print(f'FAIL {f}: range {y0}-{y1} does not cover 850-1850'); ok = False
+              else:
+                  print(f'OK   {f}: {len(t)} steps, {y0}-{y1}')
+          sys.exit(0 if ok else 1)
+          "
+
+      - name: Run CFR reconstruction
+        run: |
+          echo "Running LMR CFR reconstruction..."
+          # TQDM_MININTERVAL=30 throttles tqdm progress bars to one update
+          # every 30 seconds — GitHub Actions logs can't do \r overwriting,
+          # so each flush becomes a new line. Without this, a single KF loop
+          # prints thousands of lines.
+          # Each prior NC is bind-mounted individually (not the parent dir),
+          # so /app/data stays a normal writable container directory and
+          # cfr can still cache obs downloads (GPCC, GISTEMP) there. cfr's
+          # `if os.path.exists('./data/<basename>')` then short-circuits
+          # the prior download path and uses our validated files.
+          docker run --rm \
+            -e TQDM_MININTERVAL=30 \
+            -v $(pwd)/scripts/cfr_main_code.py:/app/cfr_main_code.py:ro \
+            -v $(pwd)/lmr_configs.yml:/app/user_config.yml:ro \
+            -v $(pwd)/lipd_cfr.pkl:/app/lipd_cfr.pkl:ro \
+            -v $(pwd)/recons:/recons \
+            -v $(pwd)/prior_data/pr_sfc_Amon_CCSM4_past1000_085001-185012.nc:/app/data/pr_sfc_Amon_CCSM4_past1000_085001-185012.nc:ro \
+            -v $(pwd)/prior_data/tas_sfc_Amon_CCSM4_past1000_085001-185012.nc:/app/data/tas_sfc_Amon_CCSM4_past1000_085001-185012.nc:ro \
+            davidedge/lmr2:latest \
+            python cfr_main_code.py
+
+      - name: Verify reconstruction results
+        run: |
+          if [ -d ./recons ] && [ "$(ls -A ./recons)" ]; then
+            echo "Reconstruction completed successfully"
+            ls -lh ./recons/
+          else
+            echo "ERROR: No reconstruction results generated"
+            exit 1
+          fi
+
+      - name: Combine seed runs into combined_recon.nc
+        run: |
+          echo "Combining all seed runs into combined_recon.nc for visualization..."
+          docker run --rm             -v $(pwd)/scripts/combine_seeds.py:/app/combine_seeds.py:ro             -v $(pwd)/recons:/recons             davidedge/lmr2:latest             python /app/combine_seeds.py
+
+      # Reconstruction outputs are NOT committed to git. combined_recon.nc
+      # is ~250 MB (10 seeds × ens=100 × 1171 yrs of tas_gm), well over
+      # GitHub's 100 MB push limit. The 90-day artifact below + the
+      # release-recon.yml bundle (Zenodo-archived) are the durable copies.
+      # lipd_cfr.pkl + lmr_configs.yml are in git so the recon is
+      # reproducible without retaining the NetCDFs.
+      - name: Upload reconstruction results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lmr-reconstruction-${{ github.run_id }}
+          path: ./recons/
+          retention-days: 90
